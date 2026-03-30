@@ -149,6 +149,7 @@ def fetch_issues_cursor(base_url: str, headers: dict, project_key: str,
         params = {
             "jql": f"project = {project_key} ORDER BY created DESC",
             "maxResults": min(100, max_issues - len(issues)),
+            "fields": "*all",
         }
         if next_token:
             params["nextPageToken"] = next_token
@@ -203,6 +204,11 @@ def analyze_fields(base_url: str, email: str, token: str,
     debug_log = []
 
     issues, dbg = fetch_issues_cursor(base_url, headers, project_key, max_issues)
+    first_issue_fields = list(issues[0].get("fields", {}).keys())[:20] if issues else []
+    custom_in_first = [k for k in first_issue_fields if k.startswith("customfield_")]
+    dbg["issues_fetched"] = len(issues)
+    dbg["first_issue_field_keys_sample"] = first_issue_fields
+    dbg["custom_fields_in_first_issue"] = custom_in_first
     debug_log.append({"label": "Issue fetch", **dbg})
 
     if not issues:
