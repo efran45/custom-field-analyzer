@@ -132,36 +132,49 @@ def fetch_custom_fields(base_url: str, email: str, token: str) -> dict:
     }
 
 
-def count_jql(base_url: str, headers: dict, jql: str) -> int:
-    """Return the total number of issues matching a JQL query (fetches no issue data)."""
-    r = requests.get(
-        f"{base_url.rstrip('/')}/rest/api/3/search/jql",
-        headers=headers,
-        params={"jql": jql, "maxResults": 0},
-        timeout=30,
-    )
+def count_jql(base_url: str, headers: dict, jql: str) -> tuple[int, dict]:
+    """
+    Return (count, debug_info) for a JQL query.
+    count = -1 means the field doesn't support JQL filtering.
+    """
+    url = f"{base_url.rstrip('/')}/rest/api/3/search/jql"
+    params = {"jql": jql, "maxResults": 0}
+    r = requests.get(url, headers=headers, params=params, timeout=30)
+
+    debug = {
+        "url": url,
+        "jql": jql,
+        "status_code": r.status_code,
+        "response_keys": list(r.json().keys()) if r.headers.get("content-type", "").startswith("application/json") else [],
+        "raw": r.text[:500],
+    }
+
     if r.status_code in (400, 404):
-        # Field may not support JQL filtering — treat as unknown
-        return -1
+        return -1, debug
     r.raise_for_status()
     data = r.json()
-    # Some Jira versions use 'total', others nest it under 'pagination'
-    return data.get("total") or data.get("pagination", {}).get("total", 0)
+    debug["response_keys"] = list(data.keys())
+    debug["raw"] = str(data)[:500]
+    count = data.get("total") or data.get("pagination", {}).get("total", 0)
+    return count, debug
 
 
 def analyze_fields(base_url: str, email: str, token: str,
-                   project_key: str, custom_fields: dict) -> tuple[pd.DataFrame, int]:
+                   project_key: str, custom_fields: dict) -> tuple[pd.DataFrame, int, list]:
     """
     For each custom field, ask Jira: how many tickets in this project
     have this field set? Uses maxResults=0 so no issue data is transferred.
-    Returns (DataFrame, total_ticket_count).
+    Returns (DataFrame, total_ticket_count, debug_log).
     """
     headers = auth_headers(email, token)
+    debug_log = []
 
     # Total tickets in project
-    total = count_jql(base_url, headers, f"project = {project_key}")
+    total, dbg = count_jql(base_url, headers, f"project = {project_key}")
+    debug_log.append({"label": "Total ticket count query", **dbg})
+
     if total <= 0:
-        return pd.DataFrame(), 0
+        return pd.DataFrame(), 0, debug_log
 
     rows = []
     field_list = list(custom_fields.items())
@@ -171,7 +184,9 @@ def analyze_fields(base_url: str, email: str, token: str,
         # Extract numeric ID: customfield_10151 → 10151
         num_id = fid.replace("customfield_", "")
         jql = f"project = {project_key} AND cf[{num_id}] is not EMPTY"
-        used = count_jql(base_url, headers, jql)
+        used, dbg = count_jql(base_url, headers, jql)
+        if i < 3:  # log first 3 field queries for debugging
+            debug_log.append({"label": f"Field query: {fname} ({fid})", **dbg})
 
         rows.append({
             "field_id":   fid,
@@ -191,7 +206,7 @@ def analyze_fields(base_url: str, email: str, token: str,
     # Separate queryable vs non-queryable, sort queryable by usage
     queryable = df[df["queryable"]].sort_values("pct", ascending=False).reset_index(drop=True)
     queryable["rank"] = queryable.index + 1
-    return queryable, total
+    return queryable, total, debug_log
 
 
 def usage_color(pct: float) -> str:
@@ -324,13 +339,18 @@ if not custom_fields:
     st.stop()
 
 try:
-    df, total_tickets = analyze_fields(base_url, email, token, project_key, custom_fields)
+    df, total_tickets, debug_log = analyze_fields(base_url, email, token, project_key, custom_fields)
 except Exception as e:
     st.error(f"Analysis failed: {e}")
     st.stop()
 
+with st.expander("🐛 Debug info", expanded=False):
+    for entry in debug_log:
+        st.markdown(f"**{entry['label']}**")
+        st.json({k: v for k, v in entry.items() if k != "label"})
+
 if df.empty or total_tickets == 0:
-    st.warning(f"No tickets found in project **{project_key}**.")
+    st.warning(f"No tickets found in project **{project_key}**. Check the debug info above.")
     st.stop()
 total_fields     = len(df)
 fields_used      = len(df[df["pct"] > 0])
