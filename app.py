@@ -132,74 +132,64 @@ def fetch_custom_fields(base_url: str, email: str, token: str) -> dict:
     }
 
 
-def fetch_issues(base_url: str, email: str, token: str, project_key: str,
-                 custom_field_ids: list[str], max_tickets: int) -> list[dict]:
+def count_jql(base_url: str, headers: dict, jql: str) -> int:
+    """Return the total number of issues matching a JQL query (fetches no issue data)."""
+    r = requests.get(
+        f"{base_url.rstrip('/')}/rest/api/2/search",
+        headers=headers,
+        params={"jql": jql, "maxResults": 0, "fields": "summary"},
+        timeout=30,
+    )
+    if r.status_code == 400:
+        # Field may not support JQL filtering — treat as unknown
+        return -1
+    r.raise_for_status()
+    return r.json().get("total", 0)
+
+
+def analyze_fields(base_url: str, email: str, token: str,
+                   project_key: str, custom_fields: dict) -> tuple[pd.DataFrame, int]:
+    """
+    For each custom field, ask Jira: how many tickets in this project
+    have this field set? Uses maxResults=0 so no issue data is transferred.
+    Returns (DataFrame, total_ticket_count).
+    """
     headers = auth_headers(email, token)
-    issues, start = [], 0
-    batch = min(100, max_tickets)
 
-    progress = st.progress(0, text="Fetching tickets from Jira...")
-    while len(issues) < max_tickets:
-        url = f"{base_url.rstrip('/')}/rest/api/3/search"
-        r = requests.get(url, headers=headers, params={
-            "jql": f"project = {project_key} ORDER BY created DESC",
-            "startAt": start,
-            "maxResults": batch,
-        }, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        batch_issues = data.get("issues", [])
-        if not batch_issues:
-            break
-        issues.extend(batch_issues)
-        total = data.get("total", 0)
-        pct = min(len(issues) / min(max_tickets, total), 1.0) if total else 1.0
-        fetched_of = min(max_tickets, total)
-        progress.progress(pct, text=f"Fetched {len(issues):,} of {fetched_of:,} tickets…")
-        start += len(batch_issues)
-        if start >= total:
-            break
+    # Total tickets in project
+    total = count_jql(base_url, headers, f"project = {project_key}")
+    if total <= 0:
+        return pd.DataFrame(), 0
 
-    progress.empty()
-    return issues[:max_tickets]
-
-
-def is_empty(value) -> bool:
-    """Return True if the field value counts as 'not filled in'."""
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return value.strip() == ""
-    if isinstance(value, list):
-        return len(value) == 0
-    if isinstance(value, dict):
-        # e.g. {"value": None} or {}
-        inner = list(value.values())
-        return all(v is None or v == "" for v in inner) if inner else True
-    return False
-
-
-def analyze_fields(issues: list[dict], custom_fields: dict) -> pd.DataFrame:
-    """Count usage of each custom field across all fetched issues."""
-    total = len(issues)
     rows = []
-    for fid, fname in custom_fields.items():
-        used = sum(
-            1 for issue in issues
-            if not is_empty(issue.get("fields", {}).get(fid))
-        )
-        pct = (used / total * 100) if total else 0
+    field_list = list(custom_fields.items())
+    progress = st.progress(0, text="Analyzing fields…")
+
+    for i, (fid, fname) in enumerate(field_list):
+        # Extract numeric ID: customfield_10151 → 10151
+        num_id = fid.replace("customfield_", "")
+        jql = f"project = {project_key} AND cf[{num_id}] is not EMPTY"
+        used = count_jql(base_url, headers, jql)
+
         rows.append({
             "field_id":   fid,
             "field_name": fname,
-            "used":       used,
-            "unused":     total - used,
-            "pct":        round(pct, 1),
+            "used":       max(used, 0),
+            "unused":     total - max(used, 0) if used >= 0 else -1,
+            "pct":        round(used / total * 100, 1) if used >= 0 else -1,
+            "queryable":  used >= 0,
         })
 
-    df = pd.DataFrame(rows).sort_values("pct", ascending=False).reset_index(drop=True)
-    df["rank"] = df.index + 1
-    return df
+        progress.progress((i + 1) / len(field_list),
+                          text=f"Checking field {i + 1} of {len(field_list)}: {fname}")
+
+    progress.empty()
+
+    df = pd.DataFrame(rows)
+    # Separate queryable vs non-queryable, sort queryable by usage
+    queryable = df[df["queryable"]].sort_values("pct", ascending=False).reset_index(drop=True)
+    queryable["rank"] = queryable.index + 1
+    return queryable, total
 
 
 def usage_color(pct: float) -> str:
@@ -259,14 +249,9 @@ with st.sidebar:
         project_key = project_options[selected]
 
         st.markdown("---")
-        st.markdown("### Options")
-        max_tickets = st.slider("Max tickets to analyze", 50, 2000, 500, step=50)
-
-        st.markdown("---")
         run_btn = st.button("▶ Analyze Fields", type="primary", use_container_width=True)
     else:
         run_btn = False
-        max_tickets = 500
 
     st.markdown("---")
     st.markdown("""
@@ -337,18 +322,14 @@ if not custom_fields:
     st.stop()
 
 try:
-    issues = fetch_issues(base_url, email, token, project_key,
-                          list(custom_fields.keys()), max_tickets)
+    df, total_tickets = analyze_fields(base_url, email, token, project_key, custom_fields)
 except Exception as e:
-    st.error(f"Failed to fetch tickets: {e}")
+    st.error(f"Analysis failed: {e}")
     st.stop()
 
-if not issues:
+if df.empty or total_tickets == 0:
     st.warning(f"No tickets found in project **{project_key}**.")
     st.stop()
-
-df = analyze_fields(issues, custom_fields)
-total_tickets    = len(issues)
 total_fields     = len(df)
 fields_used      = len(df[df["pct"] > 0])
 fields_never     = len(df[df["pct"] == 0])
@@ -362,12 +343,12 @@ st.markdown(f"""
 <div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:4px'>
   <h2 style='margin:0;font-size:1.3rem;color:#1e293b'>Results — <code>{project_key}</code></h2>
   <span style='color:#64748b;font-size:0.8rem'>
-    {total_tickets:,} tickets analyzed &nbsp;·&nbsp; connected as <b style='color:#2563eb'>{display_name}</b>
+    {total_tickets:,} total tickets in project &nbsp;·&nbsp; connected as <b style='color:#2563eb'>{display_name}</b>
   </span>
 </div>""", unsafe_allow_html=True)
 
 c1, c2, c3, c4, c5 = st.columns(5)
-with c1: kpi_card("Tickets Analyzed", f"{total_tickets:,}", color=C_MED)
+with c1: kpi_card("Total Tickets", f"{total_tickets:,}", sub="in project", color=C_MED)
 with c2: kpi_card("Custom Fields", f"{total_fields:,}", sub="in this instance", color=C_MED)
 with c3: kpi_card("Fields in Use", f"{fields_used:,}", sub=f"{fields_used/total_fields*100:.0f}% of all fields", color=C_HIGH)
 with c4: kpi_card("Never Used", f"{fields_never:,}", sub="0% usage in this project", color=C_UNUSED if fields_never else "#94a3b8")
