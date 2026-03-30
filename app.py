@@ -137,14 +137,16 @@ def count_jql(base_url: str, headers: dict, jql: str) -> int:
     r = requests.get(
         f"{base_url.rstrip('/')}/rest/api/3/search/jql",
         headers=headers,
-        params={"jql": jql, "maxResults": 0, "fields": "id"},
+        params={"jql": jql, "maxResults": 0},
         timeout=30,
     )
     if r.status_code in (400, 404):
         # Field may not support JQL filtering — treat as unknown
         return -1
     r.raise_for_status()
-    return r.json().get("total", 0)
+    data = r.json()
+    # Some Jira versions use 'total', others nest it under 'pagination'
+    return data.get("total") or data.get("pagination", {}).get("total", 0)
 
 
 def analyze_fields(base_url: str, email: str, token: str,
