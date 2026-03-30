@@ -132,6 +132,91 @@ def fetch_custom_fields(base_url: str, email: str, token: str) -> dict:
     }
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_screen_field_map(base_url: str, email: str, token: str, project_key: str,
+                           projects: list) -> tuple[dict, str | None]:
+    """
+    Return ({field_id: [screen_names]}, error_message).
+    Requires Jira admin permissions. Returns (None, error) if unavailable.
+
+    Chain: project → issuetypescreenscheme → screenscheme → screens → tabs → fields
+    """
+    headers = auth_headers(email, token)
+    base = base_url.rstrip("/")
+
+    # 1. Get project ID
+    project = next((p for p in projects if p["key"] == project_key), None)
+    if not project:
+        return {}, "Project not found in project list."
+    project_id = project["id"]
+
+    # 2. Get issue type screen scheme for this project
+    r = requests.get(f"{base}/rest/api/3/issuetypescreenscheme/project",
+                     headers=headers, params={"projectId": project_id}, timeout=30)
+    if r.status_code == 403:
+        return {}, "Admin permission required to read screen schemes (403 Forbidden)."
+    if not r.ok:
+        return {}, f"Could not fetch issue type screen scheme ({r.status_code})."
+    itss_values = r.json().get("values", [])
+    if not itss_values:
+        return {}, "No issue type screen scheme found for this project."
+    itss_id = itss_values[0]["issueTypeScreenScheme"]["id"]
+
+    # 3. Get issue type → screen scheme mappings
+    r = requests.get(f"{base}/rest/api/3/issuetypescreenscheme/{itss_id}/issuetype",
+                     headers=headers, params={"maxResults": 100}, timeout=30)
+    if not r.ok:
+        return {}, f"Could not fetch issue type mappings ({r.status_code})."
+    mappings = r.json().get("values", [])
+    screen_scheme_ids = {m["screenSchemeId"] for m in mappings}
+    # Always include the default screen scheme if present
+    if not screen_scheme_ids:
+        return {}, "No screen scheme mappings found."
+
+    # 4. For each screen scheme, get operation → screen ID map
+    OPERATION_LABELS = {
+        "create": "Create Screen",
+        "edit":   "Edit Screen",
+        "view":   "View Screen",
+        "default": "Default Screen",
+    }
+    # field_id → set of screen names
+    field_screen_map: dict[str, set] = {}
+
+    for ss_id in screen_scheme_ids:
+        r = requests.get(f"{base}/rest/api/3/screenscheme/{ss_id}",
+                         headers=headers, timeout=30)
+        if not r.ok:
+            continue
+        screens = r.json().get("screens", {})  # {"default": 123, "create": 456, ...}
+
+        for operation, screen_id in screens.items():
+            screen_label = OPERATION_LABELS.get(operation, operation.title())
+
+            # 5. Get tabs for this screen
+            r2 = requests.get(f"{base}/rest/api/3/screens/{screen_id}/tabs",
+                               headers=headers, timeout=30)
+            if not r2.ok:
+                continue
+            tabs = r2.json() if isinstance(r2.json(), list) else r2.json().get("values", [])
+
+            # 6. Get fields for each tab
+            for tab in tabs:
+                tab_id = tab["id"]
+                r3 = requests.get(
+                    f"{base}/rest/api/3/screens/{screen_id}/tabs/{tab_id}/fields",
+                    headers=headers, timeout=30)
+                if not r3.ok:
+                    continue
+                fields = r3.json() if isinstance(r3.json(), list) else r3.json().get("values", [])
+                for field in fields:
+                    fid = field.get("id", "")
+                    if fid.startswith("customfield_"):
+                        field_screen_map.setdefault(fid, set()).add(screen_label)
+
+    return {k: sorted(v) for k, v in field_screen_map.items()}, None
+
+
 def fetch_issues_cursor(base_url: str, headers: dict, project_key: str,
                         max_issues: int) -> tuple[list, dict]:
     """
@@ -391,7 +476,7 @@ try:
 except Exception as e:
     analysis_error = str(e)
 
-with st.expander("🐛 Debug info", expanded=True):
+with st.expander("🐛 Debug info", expanded=False):
     if analysis_error:
         st.error(f"Analysis exception: {analysis_error}")
     if not debug_log:
@@ -406,6 +491,20 @@ if analysis_error:
 if df.empty or total_tickets == 0:
     st.warning(f"No tickets found in project **{project_key}**. Check the debug info above.")
     st.stop()
+
+# Fetch screen → field mapping (requires admin; gracefully degrades if unavailable)
+with st.spinner("Loading screen configuration…"):
+    projects_list = st.session_state.get("projects", [])
+    screen_map, screen_error = fetch_screen_field_map(base_url, email, token, project_key, projects_list)
+
+if screen_error:
+    st.info(f"ℹ️ Screen breakdown unavailable: {screen_error}")
+
+# Add screens column to df
+if screen_map:
+    df["screens"] = df["field_id"].map(lambda fid: ", ".join(screen_map.get(fid, ["Unknown"])))
+else:
+    df["screens"] = "—"
 total_fields     = len(df)
 fields_used      = len(df[df["pct"] > 0])
 fields_never     = len(df[df["pct"] == 0])
@@ -564,17 +663,64 @@ if not never_used.empty:
         hide_index=True,
     )
 
+# ── By screen ─────────────────────────────────────────────────────────────────
+if screen_map:
+    st.markdown("<br>", unsafe_allow_html=True)
+    section_header("Usage by Screen", "Fields grouped by which screen they appear on")
+
+    all_screens = sorted({s for screens in screen_map.values() for s in screens})
+    screen_tabs = st.tabs(all_screens)
+
+    for tab, screen_name in zip(screen_tabs, all_screens):
+        with tab:
+            screen_df = df[df["screens"].str.contains(screen_name, na=False)].copy()
+            if screen_df.empty:
+                st.info(f"No custom fields found on {screen_name}.")
+                continue
+
+            # Mini bar chart
+            screen_df_sorted = screen_df.sort_values("pct", ascending=True)
+            fig = go.Figure(go.Bar(
+                x=screen_df_sorted["pct"],
+                y=screen_df_sorted["field_name"],
+                orientation="h",
+                marker_color=[usage_color(p) for p in screen_df_sorted["pct"]],
+                hovertemplate="<b>%{y}</b><br>%{x:.1f}%<extra></extra>",
+            ))
+            fig.update_layout(
+                xaxis=dict(title=None, range=[0, 100], ticksuffix="%",
+                           gridcolor="#e2e8f0", tickfont=dict(color="#64748b")),
+                yaxis=dict(tickfont=dict(color="#1e293b", size=11)),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                margin=dict(t=10, b=20, l=220, r=10),
+                height=max(300, len(screen_df) * 24),
+                showlegend=False,
+            )
+            st.plotly_chart(fig, use_container_width=True,
+                            config={"displayModeBar": False},
+                            key=f"screen_chart_{screen_name.replace(' ', '_')}")
+
+            screen_display = screen_df[["rank", "field_name", "field_id", "used", "unused", "pct"]].rename(columns={
+                "rank": "Rank", "field_name": "Field Name", "field_id": "Field ID",
+                "used": "With Value", "unused": "Without Value", "pct": "Usage %",
+            })
+            st.dataframe(screen_display, use_container_width=True, hide_index=True,
+                         column_config={"Usage %": st.column_config.ProgressColumn(
+                             "Usage %", min_value=0, max_value=100, format="%.1f%%")})
+
 # ── Full data table ───────────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
 section_header("Full Field Table", "All custom fields — sortable")
 
-display_df = df[["rank", "field_name", "field_id", "used", "unused", "pct"]].rename(columns={
+display_df = df[["rank", "field_name", "field_id", "used", "unused", "pct", "screens"]].rename(columns={
     "rank":       "Rank",
     "field_name": "Field Name",
     "field_id":   "Field ID",
     "used":       "Tickets with Value",
     "unused":     "Tickets without Value",
     "pct":        "Usage %",
+    "screens":    "Screens",
 })
 st.dataframe(display_df, use_container_width=True, hide_index=True,
              column_config={"Usage %": st.column_config.ProgressColumn(
