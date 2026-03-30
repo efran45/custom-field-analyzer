@@ -141,12 +141,10 @@ def fetch_issues(base_url: str, email: str, token: str, project_key: str,
 
     progress = st.progress(0, text="Fetching tickets from Jira...")
     while len(issues) < max_tickets:
-        # POST /rest/api/3/search with fields=*all avoids 414 URI Too Large
         payload = {
             "jql": f"project = {project_key} ORDER BY created DESC",
             "startAt": start,
             "maxResults": batch,
-            "fields": ["*all"],
         }
         url = f"{base_url.rstrip('/')}/rest/api/3/search"
         r = requests.post(url, headers=headers, json=payload, timeout=30)
