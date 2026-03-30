@@ -138,7 +138,7 @@ def count_jql(base_url: str, headers: dict, jql: str) -> tuple[int, dict]:
     count = -1 means the field doesn't support JQL filtering.
     Never raises — all errors captured in debug_info.
     """
-    url = f"{base_url.rstrip('/')}/rest/api/3/search/jql"
+    url = f"{base_url.rstrip('/')}/rest/api/3/search"
     params = {"jql": jql, "maxResults": 1}
     debug = {"url": url, "jql": jql, "status_code": None, "response_keys": [], "raw": ""}
 
