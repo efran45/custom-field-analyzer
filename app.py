@@ -133,88 +133,53 @@ def fetch_custom_fields(base_url: str, email: str, token: str) -> dict:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_screen_field_map(base_url: str, email: str, token: str, project_key: str,
-                           projects: list) -> tuple[dict, str | None]:
+def fetch_screen_field_map(base_url: str, email: str, token: str,
+                           project_key: str, sample_issue_key: str) -> tuple[dict, str | None]:
     """
     Return ({field_id: [screen_names]}, error_message).
-    Requires Jira admin permissions. Returns (None, error) if unavailable.
-
-    Chain: project → issuetypescreenscheme → screenscheme → screens → tabs → fields
+    Uses createmeta (Create screen) and editmeta (Edit screen) — no admin needed.
     """
     headers = auth_headers(email, token)
     base = base_url.rstrip("/")
-
-    # 1. Get project ID
-    project = next((p for p in projects if p["key"] == project_key), None)
-    if not project:
-        return {}, "Project not found in project list."
-    project_id = project["id"]
-
-    # 2. Get issue type screen scheme for this project
-    r = requests.get(f"{base}/rest/api/3/issuetypescreenscheme/project",
-                     headers=headers, params={"projectId": project_id}, timeout=30)
-    if r.status_code == 403:
-        return {}, "Admin permission required to read screen schemes (403 Forbidden)."
-    if not r.ok:
-        return {}, f"Could not fetch issue type screen scheme ({r.status_code})."
-    itss_values = r.json().get("values", [])
-    if not itss_values:
-        return {}, "No issue type screen scheme found for this project."
-    itss_id = itss_values[0]["issueTypeScreenScheme"]["id"]
-
-    # 3. Get issue type → screen scheme mappings
-    r = requests.get(f"{base}/rest/api/3/issuetypescreenscheme/mapping",
-                     headers=headers,
-                     params={"issueTypeScreenSchemeId": itss_id, "maxResults": 100},
-                     timeout=30)
-    if not r.ok:
-        return {}, f"Could not fetch issue type mappings ({r.status_code})."
-    mappings = r.json().get("values", [])
-    screen_scheme_ids = {m["screenSchemeId"] for m in mappings}
-    # Always include the default screen scheme if present
-    if not screen_scheme_ids:
-        return {}, "No screen scheme mappings found."
-
-    # 4. For each screen scheme, get operation → screen ID map
-    OPERATION_LABELS = {
-        "create": "Create Screen",
-        "edit":   "Edit Screen",
-        "view":   "View Screen",
-        "default": "Default Screen",
-    }
-    # field_id → set of screen names
     field_screen_map: dict[str, set] = {}
 
-    for ss_id in screen_scheme_ids:
-        r = requests.get(f"{base}/rest/api/3/screenscheme/{ss_id}",
-                         headers=headers, timeout=30)
-        if not r.ok:
-            continue
-        screens = r.json().get("screens", {})  # {"default": 123, "create": 456, ...}
-
-        for operation, screen_id in screens.items():
-            screen_label = OPERATION_LABELS.get(operation, operation.title())
-
-            # 5. Get tabs for this screen
-            r2 = requests.get(f"{base}/rest/api/3/screens/{screen_id}/tabs",
-                               headers=headers, timeout=30)
+    # ── Create screen ─────────────────────────────────────────────────────────
+    # Get issue types for this project
+    r = requests.get(f"{base}/rest/api/3/issue/createmeta/{project_key}/issuetypes",
+                     headers=headers, params={"maxResults": 50}, timeout=30)
+    if r.ok:
+        issue_types = r.json().get("issueTypes", r.json().get("values", []))
+        for it in issue_types:
+            it_id = it.get("id")
+            if not it_id:
+                continue
+            r2 = requests.get(
+                f"{base}/rest/api/3/issue/createmeta/{project_key}/issuetypes/{it_id}",
+                headers=headers, params={"maxResults": 200}, timeout=30)
             if not r2.ok:
                 continue
-            tabs = r2.json() if isinstance(r2.json(), list) else r2.json().get("values", [])
+            fields = r2.json().get("fields", r2.json().get("values", []))
+            # fields can be a list or a dict keyed by field id
+            if isinstance(fields, dict):
+                fids = [fid for fid in fields if fid.startswith("customfield_")]
+            else:
+                fids = [f.get("fieldId", f.get("id", "")) for f in fields
+                        if f.get("fieldId", f.get("id", "")).startswith("customfield_")]
+            for fid in fids:
+                field_screen_map.setdefault(fid, set()).add("Create Screen")
 
-            # 6. Get fields for each tab
-            for tab in tabs:
-                tab_id = tab["id"]
-                r3 = requests.get(
-                    f"{base}/rest/api/3/screens/{screen_id}/tabs/{tab_id}/fields",
-                    headers=headers, timeout=30)
-                if not r3.ok:
-                    continue
-                fields = r3.json() if isinstance(r3.json(), list) else r3.json().get("values", [])
-                for field in fields:
-                    fid = field.get("id", "")
-                    if fid.startswith("customfield_"):
-                        field_screen_map.setdefault(fid, set()).add(screen_label)
+    # ── Edit screen ───────────────────────────────────────────────────────────
+    if sample_issue_key:
+        r = requests.get(f"{base}/rest/api/3/issue/{sample_issue_key}/editmeta",
+                         headers=headers, timeout=30)
+        if r.ok:
+            fields = r.json().get("fields", {})
+            for fid in fields:
+                if fid.startswith("customfield_"):
+                    field_screen_map.setdefault(fid, set()).add("Edit Screen")
+
+    if not field_screen_map:
+        return {}, "Could not retrieve screen field data from createmeta or editmeta."
 
     return {k: sorted(v) for k, v in field_screen_map.items()}, None
 
@@ -255,6 +220,9 @@ def fetch_issues_cursor(base_url: str, headers: dict, project_key: str,
 
         batch = data.get("issues", [])
         issues.extend(batch)
+        # Store a sample issue key for editmeta lookup
+        if batch and not st.session_state.get("sample_issue_key"):
+            st.session_state["sample_issue_key"] = batch[0]["key"]
 
         if data.get("isLast", True) or not batch:
             break
@@ -494,10 +462,10 @@ if df.empty or total_tickets == 0:
     st.warning(f"No tickets found in project **{project_key}**. Check the debug info above.")
     st.stop()
 
-# Fetch screen → field mapping (requires admin; gracefully degrades if unavailable)
+# Fetch screen → field mapping using createmeta/editmeta (no admin needed)
+sample_issue_key = st.session_state.get("sample_issue_key", "")
 with st.spinner("Loading screen configuration…"):
-    projects_list = st.session_state.get("projects", [])
-    screen_map, screen_error = fetch_screen_field_map(base_url, email, token, project_key, projects_list)
+    screen_map, screen_error = fetch_screen_field_map(base_url, email, token, project_key, sample_issue_key)
 
 if screen_error:
     st.info(f"ℹ️ Screen breakdown unavailable: {screen_error}")
