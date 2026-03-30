@@ -679,6 +679,22 @@ if screen_map:
                          column_config={"Usage %": st.column_config.ProgressColumn(
                              "Usage %", min_value=0, max_value=100, format="%.1f%%")})
 
+# ── Unused fields ─────────────────────────────────────────────────────────────
+st.markdown("<br>", unsafe_allow_html=True)
+unused_df = df[df["pct"] == 0][["field_name", "field_id", "screens"]].sort_values("field_name").reset_index(drop=True)
+section_header(
+    f"🗑️ Unused Fields ({len(unused_df)})",
+    "Fields with 0% usage across all sampled tickets — alphabetical order"
+)
+if unused_df.empty:
+    st.success("No unused fields found — everything is being used!")
+else:
+    st.dataframe(
+        unused_df.rename(columns={"field_name": "Field Name", "field_id": "Field ID", "screens": "Screens"}),
+        use_container_width=True,
+        hide_index=True,
+    )
+
 # ── Full data table ───────────────────────────────────────────────────────────
 st.markdown("<br>", unsafe_allow_html=True)
 section_header("Full Field Table", "All custom fields — sortable")
