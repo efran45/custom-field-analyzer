@@ -139,7 +139,7 @@ def count_jql(base_url: str, headers: dict, jql: str) -> tuple[int, dict]:
     Never raises — all errors captured in debug_info.
     """
     url = f"{base_url.rstrip('/')}/rest/api/3/search/jql"
-    params = {"jql": jql, "maxResults": 0}
+    params = {"jql": jql, "maxResults": 1}
     debug = {"url": url, "jql": jql, "status_code": None, "response_keys": [], "raw": ""}
 
     try:
