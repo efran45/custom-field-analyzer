@@ -163,8 +163,10 @@ def fetch_screen_field_map(base_url: str, email: str, token: str, project_key: s
     itss_id = itss_values[0]["issueTypeScreenScheme"]["id"]
 
     # 3. Get issue type → screen scheme mappings
-    r = requests.get(f"{base}/rest/api/3/issuetypescreenscheme/{itss_id}/issuetype",
-                     headers=headers, params={"maxResults": 100}, timeout=30)
+    r = requests.get(f"{base}/rest/api/3/issuetypescreenscheme/mapping",
+                     headers=headers,
+                     params={"issueTypeScreenSchemeId": itss_id, "maxResults": 100},
+                     timeout=30)
     if not r.ok:
         return {}, f"Could not fetch issue type mappings ({r.status_code})."
     mappings = r.json().get("values", [])
