@@ -295,7 +295,7 @@ with st.sidebar:
 
         st.markdown("---")
         st.markdown("### Options")
-        max_issues = st.slider("Tickets to sample", 50, 1000, 200, step=50)
+        max_issues = st.slider("Tickets to sample", 50, 10000, 500, step=50)
         st.markdown("---")
         run_btn = st.button("▶ Analyze Fields", type="primary", use_container_width=True)
     else:
