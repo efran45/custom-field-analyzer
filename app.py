@@ -136,27 +136,33 @@ def count_jql(base_url: str, headers: dict, jql: str) -> tuple[int, dict]:
     """
     Return (count, debug_info) for a JQL query.
     count = -1 means the field doesn't support JQL filtering.
+    Never raises — all errors captured in debug_info.
     """
     url = f"{base_url.rstrip('/')}/rest/api/3/search/jql"
     params = {"jql": jql, "maxResults": 0}
-    r = requests.get(url, headers=headers, params=params, timeout=30)
+    debug = {"url": url, "jql": jql, "status_code": None, "response_keys": [], "raw": ""}
 
-    debug = {
-        "url": url,
-        "jql": jql,
-        "status_code": r.status_code,
-        "response_keys": list(r.json().keys()) if r.headers.get("content-type", "").startswith("application/json") else [],
-        "raw": r.text[:500],
-    }
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        debug["status_code"] = r.status_code
+        debug["raw"] = r.text[:800]
+        try:
+            data = r.json()
+            debug["response_keys"] = list(data.keys())
+        except Exception:
+            data = {}
 
-    if r.status_code in (400, 404):
+        if r.status_code in (400, 404):
+            return -1, debug
+        if not r.ok:
+            return -1, debug
+
+        count = data.get("total") or data.get("pagination", {}).get("total", 0)
+        return count, debug
+
+    except Exception as e:
+        debug["raw"] = f"Request exception: {e}"
         return -1, debug
-    r.raise_for_status()
-    data = r.json()
-    debug["response_keys"] = list(data.keys())
-    debug["raw"] = str(data)[:500]
-    count = data.get("total") or data.get("pagination", {}).get("total", 0)
-    return count, debug
 
 
 def analyze_fields(base_url: str, email: str, token: str,
@@ -338,16 +344,27 @@ if not custom_fields:
     st.warning("No custom fields found in this Jira instance.")
     st.stop()
 
+debug_log = []
+df = pd.DataFrame()
+total_tickets = 0
+analysis_error = None
+
 try:
     df, total_tickets, debug_log = analyze_fields(base_url, email, token, project_key, custom_fields)
 except Exception as e:
-    st.error(f"Analysis failed: {e}")
-    st.stop()
+    analysis_error = str(e)
 
-with st.expander("🐛 Debug info", expanded=False):
+with st.expander("🐛 Debug info", expanded=True):
+    if analysis_error:
+        st.error(f"Analysis exception: {analysis_error}")
+    if not debug_log:
+        st.warning("No debug entries collected — analysis may have crashed before any queries ran.")
     for entry in debug_log:
         st.markdown(f"**{entry['label']}**")
         st.json({k: v for k, v in entry.items() if k != "label"})
+
+if analysis_error:
+    st.stop()
 
 if df.empty or total_tickets == 0:
     st.warning(f"No tickets found in project **{project_key}**. Check the debug info above.")
