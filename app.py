@@ -135,19 +135,17 @@ def fetch_custom_fields(base_url: str, email: str, token: str) -> dict:
 def fetch_issues(base_url: str, email: str, token: str, project_key: str,
                  custom_field_ids: list[str], max_tickets: int) -> list[dict]:
     headers = auth_headers(email, token)
-    headers["Content-Type"] = "application/json"
     issues, start = [], 0
     batch = min(100, max_tickets)
 
     progress = st.progress(0, text="Fetching tickets from Jira...")
     while len(issues) < max_tickets:
-        payload = {
+        url = f"{base_url.rstrip('/')}/rest/api/3/search"
+        r = requests.get(url, headers=headers, params={
             "jql": f"project = {project_key} ORDER BY created DESC",
             "startAt": start,
             "maxResults": batch,
-        }
-        url = f"{base_url.rstrip('/')}/rest/api/3/search"
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        }, timeout=30)
         r.raise_for_status()
         data = r.json()
         batch_issues = data.get("issues", [])
