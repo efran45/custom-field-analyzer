@@ -215,9 +215,20 @@ def analyze_fields(base_url: str, email: str, token: str,
         return pd.DataFrame(), 0, debug_log
 
     total = len(issues)
-    rows = []
 
-    for fid, fname in custom_fields.items():
+    # Only analyze fields whose keys actually appear in this project's issue payloads.
+    # Fields on the project's screens are always present as keys (even if null);
+    # fields not on any screen are absent entirely.
+    project_field_ids = {
+        key for issue in issues
+        for key in issue.get("fields", {}).keys()
+        if key.startswith("customfield_")
+    }
+    debug_log[0]["project_field_ids_found"] = len(project_field_ids)
+
+    rows = []
+    for fid in project_field_ids:
+        fname = custom_fields.get(fid, fid)  # fall back to ID if name unknown
         used = sum(
             1 for issue in issues
             if not is_empty(issue.get("fields", {}).get(fid))
