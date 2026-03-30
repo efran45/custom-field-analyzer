@@ -132,87 +132,103 @@ def fetch_custom_fields(base_url: str, email: str, token: str) -> dict:
     }
 
 
-def count_jql(base_url: str, headers: dict, jql: str) -> tuple[int, dict]:
+def fetch_issues_cursor(base_url: str, headers: dict, project_key: str,
+                        max_issues: int) -> tuple[list, dict]:
     """
-    Return (count, debug_info) for a JQL query.
-    count = -1 means the field doesn't support JQL filtering.
-    Never raises — all errors captured in debug_info.
+    Fetch issues using /rest/api/3/search/jql cursor pagination.
+    Returns (issues, debug_info).
     """
-    url = f"{base_url.rstrip('/')}/rest/api/3/search"
-    params = {"jql": jql, "maxResults": 1}
-    debug = {"url": url, "jql": jql, "status_code": None, "response_keys": [], "raw": ""}
+    url = f"{base_url.rstrip('/')}/rest/api/3/search/jql"
+    issues = []
+    next_token = None
+    debug = {"url": url, "status_code": None, "response_keys": [], "raw": "", "batches": 0}
 
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        debug["status_code"] = r.status_code
-        debug["raw"] = r.text[:800]
+    progress = st.progress(0, text="Fetching tickets…")
+
+    while len(issues) < max_issues:
+        params = {
+            "jql": f"project = {project_key} ORDER BY created DESC",
+            "maxResults": min(100, max_issues - len(issues)),
+        }
+        if next_token:
+            params["nextPageToken"] = next_token
+
         try:
+            r = requests.get(url, headers=headers, params=params, timeout=30)
+            debug["status_code"] = r.status_code
+            debug["raw"] = r.text[:800]
+            r.raise_for_status()
             data = r.json()
             debug["response_keys"] = list(data.keys())
-        except Exception:
-            data = {}
+            debug["batches"] += 1
+        except Exception as e:
+            debug["raw"] = f"Exception: {e}"
+            break
 
-        if r.status_code in (400, 404):
-            return -1, debug
-        if not r.ok:
-            return -1, debug
+        batch = data.get("issues", [])
+        issues.extend(batch)
 
-        count = data.get("total") or data.get("pagination", {}).get("total", 0)
-        return count, debug
+        if data.get("isLast", True) or not batch:
+            break
+        next_token = data.get("nextPageToken")
 
-    except Exception as e:
-        debug["raw"] = f"Request exception: {e}"
-        return -1, debug
+        pct = min(len(issues) / max_issues, 1.0)
+        progress.progress(pct, text=f"Fetched {len(issues):,} tickets…")
+
+    progress.empty()
+    return issues, debug
+
+
+def is_empty(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip() == ""
+    if isinstance(value, list):
+        return len(value) == 0
+    if isinstance(value, dict):
+        inner = list(value.values())
+        return all(v is None or v == "" for v in inner) if inner else True
+    return False
 
 
 def analyze_fields(base_url: str, email: str, token: str,
-                   project_key: str, custom_fields: dict) -> tuple[pd.DataFrame, int, list]:
+                   project_key: str, custom_fields: dict,
+                   max_issues: int) -> tuple[pd.DataFrame, int, list]:
     """
-    For each custom field, ask Jira: how many tickets in this project
-    have this field set? Uses maxResults=0 so no issue data is transferred.
-    Returns (DataFrame, total_ticket_count, debug_log).
+    Fetch a sample of tickets, then count how many have each custom field set.
+    Returns (DataFrame, total_fetched, debug_log).
     """
     headers = auth_headers(email, token)
     debug_log = []
 
-    # Total tickets in project
-    total, dbg = count_jql(base_url, headers, f"project = {project_key}")
-    debug_log.append({"label": "Total ticket count query", **dbg})
+    issues, dbg = fetch_issues_cursor(base_url, headers, project_key, max_issues)
+    debug_log.append({"label": "Issue fetch", **dbg})
 
-    if total <= 0:
+    if not issues:
         return pd.DataFrame(), 0, debug_log
 
+    total = len(issues)
     rows = []
-    field_list = list(custom_fields.items())
-    progress = st.progress(0, text="Analyzing fields…")
 
-    for i, (fid, fname) in enumerate(field_list):
-        # Extract numeric ID: customfield_10151 → 10151
-        num_id = fid.replace("customfield_", "")
-        jql = f"project = {project_key} AND cf[{num_id}] is not EMPTY"
-        used, dbg = count_jql(base_url, headers, jql)
-        if i < 3:  # log first 3 field queries for debugging
-            debug_log.append({"label": f"Field query: {fname} ({fid})", **dbg})
-
+    for fid, fname in custom_fields.items():
+        used = sum(
+            1 for issue in issues
+            if not is_empty(issue.get("fields", {}).get(fid))
+        )
         rows.append({
             "field_id":   fid,
             "field_name": fname,
-            "used":       max(used, 0),
-            "unused":     total - max(used, 0) if used >= 0 else -1,
-            "pct":        round(used / total * 100, 1) if used >= 0 else -1,
-            "queryable":  used >= 0,
+            "used":       used,
+            "unused":     total - used,
+            "pct":        round(used / total * 100, 1),
         })
 
-        progress.progress((i + 1) / len(field_list),
-                          text=f"Checking field {i + 1} of {len(field_list)}: {fname}")
-
-    progress.empty()
-
-    df = pd.DataFrame(rows)
-    # Separate queryable vs non-queryable, sort queryable by usage
-    queryable = df[df["queryable"]].sort_values("pct", ascending=False).reset_index(drop=True)
-    queryable["rank"] = queryable.index + 1
-    return queryable, total, debug_log
+    df = (pd.DataFrame(rows)
+            .sort_values("pct", ascending=False)
+            .reset_index(drop=True))
+    df["rank"] = df.index + 1
+    return df, total, debug_log
 
 
 def usage_color(pct: float) -> str:
@@ -272,9 +288,13 @@ with st.sidebar:
         project_key = project_options[selected]
 
         st.markdown("---")
+        st.markdown("### Options")
+        max_issues = st.slider("Tickets to sample", 50, 1000, 200, step=50)
+        st.markdown("---")
         run_btn = st.button("▶ Analyze Fields", type="primary", use_container_width=True)
     else:
         run_btn = False
+        max_issues = 200
 
     st.markdown("---")
     st.markdown("""
@@ -350,7 +370,7 @@ total_tickets = 0
 analysis_error = None
 
 try:
-    df, total_tickets, debug_log = analyze_fields(base_url, email, token, project_key, custom_fields)
+    df, total_tickets, debug_log = analyze_fields(base_url, email, token, project_key, custom_fields, max_issues)
 except Exception as e:
     analysis_error = str(e)
 
@@ -387,7 +407,7 @@ st.markdown(f"""
 </div>""", unsafe_allow_html=True)
 
 c1, c2, c3, c4, c5 = st.columns(5)
-with c1: kpi_card("Total Tickets", f"{total_tickets:,}", sub="in project", color=C_MED)
+with c1: kpi_card("Tickets Sampled", f"{total_tickets:,}", sub="most recent", color=C_MED)
 with c2: kpi_card("Custom Fields", f"{total_fields:,}", sub="in this instance", color=C_MED)
 with c3: kpi_card("Fields in Use", f"{fields_used:,}", sub=f"{fields_used/total_fields*100:.0f}% of all fields", color=C_HIGH)
 with c4: kpi_card("Never Used", f"{fields_never:,}", sub="0% usage in this project", color=C_UNUSED if fields_never else "#94a3b8")
